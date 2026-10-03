@@ -18,11 +18,15 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "i2c.h"
+#include "tim.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "mpu6050_port.h"
+#include "balance.h"
+#include "motor_port.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -43,7 +47,15 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
+static mpu6050_t g_mpu;
+static mpu6050_data_t g_mpu_data;
+static mpu6050_status_t g_mpu_status;
+static uint8_t g_mpu_ready;
+static balance_angle_t g_balance_angle;
+static balance_pd_t g_balance_pd;
+static float g_balance_out;
+/* 调试器里确认角度方向后再写成 1，避免上电就转 */
+static uint8_t g_balance_enable = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -86,8 +98,19 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_I2C1_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-
+  /*
+   * AD0 接地用 MPU6050_ADDR_AD0_LOW。车体放稳后再标定零偏：
+   *   mpu6050_calibrate_gyro(&g_mpu, 200);
+   * 调试器里观察 g_mpu_data。静止时 accel 向量长度约 1 g，gyro 约 0。
+   */
+  g_mpu_status = mpu6050_port_init(&g_mpu, &hi2c1, MPU6050_ADDR_AD0_LOW, 0);
+  g_mpu_ready = (g_mpu_status == MPU6050_OK) ? 1U : 0U;
+  balance_angle_init(&g_balance_angle);
+  balance_pd_init(&g_balance_pd);
+  motor_port_init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -97,6 +120,28 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    if (g_mpu_ready != 0U) {
+      static uint32_t s_mpu_tick = 0;
+      uint32_t now = HAL_GetTick();
+
+      /* 与默认 200 Hz 采样对齐，避免在 100 kHz I2C 上连续空转 */
+      if ((now - s_mpu_tick) >= 5U) {
+        float dt_s = (float)(now - s_mpu_tick) / 1000.0f;
+
+        s_mpu_tick = now;
+        g_mpu_status = mpu6050_read(&g_mpu, &g_mpu_data);
+        if (g_mpu_status == MPU6050_OK) {
+          g_balance_out = balance_step(&g_balance_angle, &g_balance_pd,
+                                       g_mpu_data.accel_g, g_mpu_data.gyro_dps,
+                                       BALANCE_GYRO_AXIS, dt_s);
+          /* 使能为 0 时仍计算 g_balance_out，方便先看方向再打开电机 */
+          motor_port_set((g_balance_enable != 0U) ? g_balance_out : 0.0f);
+        } else {
+          g_balance_out = 0.0f;
+          motor_port_set(0.0f);
+        }
+      }
+    }
   }
   /* USER CODE END 3 */
 }
